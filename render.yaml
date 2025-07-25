@@ -2,7 +2,7 @@ services:
   - type: web
     name: workout-bot
     env: python
-    pythonVersion: 3.11
+    plan: free
+    pythonVersion: 3.10
     buildCommand: pip install -r requirements.txt
-    startCommand: python3 main.py
-    autoDeploy: true
+    startCommand: python main.py
