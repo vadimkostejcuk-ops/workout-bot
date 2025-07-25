@@ -1,185 +1,269 @@
-import logging
+import os
+from dotenv import load_dotenv
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, ConversationHandler,
+    CallbackQueryHandler, MessageHandler, filters
+)
 import sqlite3
 from datetime import datetime
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 
-# Состояния
-CHOOSE_ACTION, EXERCISE_NAME, SETS, REPS, WEIGHT = range(5)
+load_dotenv()  # Загружаем переменные из .env
 
-# Временное хранилище
-user_data = {}
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("TELEGRAM_TOKEN не задан в переменных окружения!")
 
-# Инициализация БД
-def init_db():
-    conn = sqlite3.connect("workouts.db")
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS workouts (
-            user_id INTEGER,
-            date TEXT,
-            exercise TEXT,
-            sets INTEGER,
-            reps INTEGER,
-            weight REAL
-        )
-    """)
-    conn.commit()
-    conn.close()
+# Состояния для ConversationHandler
+(
+    MAIN_MENU,
+    ADD_EXERCISE_NAME,
+    ADD_EXERCISE_SETS,
+    ADD_EXERCISE_REPS,
+    ADD_EXERCISE_WEIGHT,
+    CONFIRM_ADD_ANOTHER,
+    VIEW_HISTORY,
+    VIEW_WORKOUT_DETAILS,
+) = range(8)
 
-# Главное меню
-def main_menu_keyboard():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("Начать тренировку")],
-        [KeyboardButton("Просмотреть историю тренировок")]
-    ], resize_keyboard=True)
+# Подключение к базе
+conn = sqlite3.connect('workouts.db', check_same_thread=False)
+c = conn.cursor()
 
-# Старт
+# Создаем таблицы, если их нет
+c.execute('''
+CREATE TABLE IF NOT EXISTS workouts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    date TEXT,
+    weekday TEXT
+)
+''')
+c.execute('''
+CREATE TABLE IF NOT EXISTS exercises (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workout_id INTEGER,
+    name TEXT,
+    sets INTEGER,
+    reps INTEGER,
+    weight REAL,
+    FOREIGN KEY(workout_id) REFERENCES workouts(id)
+)
+''')
+conn.commit()
+
+# Хранилище для данных сессии (упрощенно)
+user_sessions = {}
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Выбери действие:", reply_markup=main_menu_keyboard())
-    return CHOOSE_ACTION
+    keyboard = [
+        [InlineKeyboardButton("Начать тренировку", callback_data='start_workout')],
+        [InlineKeyboardButton("Просмотреть историю тренировок", callback_data='view_history')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Привет! Выбери действие:", reply_markup=reply_markup)
+    return MAIN_MENU
 
-# Обработка кнопок главного меню
-async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "Начать тренировку":
-        user_data[update.effective_user.id] = {
-            "exercises": [],
-            "current_exercise": {}
-        }
-        await update.message.reply_text("Введите название первого упражнения:")
-        return EXERCISE_NAME
-    elif text == "Просмотреть историю тренировок":
+async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == 'start_workout':
+        user_id = query.from_user.id
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        weekday_str = datetime.now().strftime('%A')
+        # Создаем новую тренировку в БД
+        c.execute("INSERT INTO workouts (user_id, date, weekday) VALUES (?, ?, ?)", (user_id, today_str, weekday_str))
+        conn.commit()
+        workout_id = c.lastrowid
+        user_sessions[user_id] = {'workout_id': workout_id, 'exercises': []}
+
+        await query.message.edit_text("Введите название первого упражнения:")
+        return ADD_EXERCISE_NAME
+
+    elif data == 'view_history':
         return await show_history_menu(update, context)
 
-# Ввод названия
-async def input_exercise_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data[user_id]["current_exercise"] = {"name": update.message.text}
+async def add_exercise_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    text = update.message.text.strip()
+    session = user_sessions.get(user_id)
+    if not session:
+        await update.message.reply_text("Сессия не найдена, начните тренировку заново.")
+        return ConversationHandler.END
+
+    # Сохраняем название упражнения
+    session.setdefault('current_exercise', {})['name'] = text
     await update.message.reply_text("Сколько подходов?")
-    return SETS
+    return ADD_EXERCISE_SETS
 
-# Ввод подходов
-async def input_sets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data[user_id]["current_exercise"]["sets"] = int(update.message.text)
-    await update.message.reply_text("Сколько повторений?")
-    return REPS
+async def add_exercise_sets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("Пожалуйста, введите число для подходов.")
+        return ADD_EXERCISE_SETS
 
-# Ввод повторений
-async def input_reps(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data[user_id]["current_exercise"]["reps"] = int(update.message.text)
-    await update.message.reply_text("Какой вес?")
-    return WEIGHT
+    session = user_sessions.get(user_id)
+    session['current_exercise']['sets'] = int(text)
+    await update.message.reply_text("Сколько повторений в подходе?")
+    return ADD_EXERCISE_REPS
 
-# Ввод веса
-async def input_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data[user_id]["current_exercise"]["weight"] = float(update.message.text)
-    user_data[user_id]["exercises"].append(user_data[user_id]["current_exercise"])
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Добавить упражнение", callback_data="add_more")],
-        [InlineKeyboardButton("Закончить тренировку", callback_data="finish")]
-    ])
-    await update.message.reply_text("Упражнение добавлено.", reply_markup=keyboard)
-    return CHOOSE_ACTION
+async def add_exercise_reps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("Пожалуйста, введите число для повторений.")
+        return ADD_EXERCISE_REPS
 
-# Кнопки после добавления упражнения
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
+    session = user_sessions.get(user_id)
+    session['current_exercise']['reps'] = int(text)
+    await update.message.reply_text("Какой рабочий вес (кг)? Введите число, можно с десятичной точкой.")
+    return ADD_EXERCISE_WEIGHT
 
-    if query.data == "add_more":
-        await query.edit_message_text("Введите название следующего упражнения:")
-        return EXERCISE_NAME
-    elif query.data == "finish":
-        now = datetime.now()
-        date_str = now.strftime("%Y-%m-%d")
-        conn = sqlite3.connect("workouts.db")
-        c = conn.cursor()
-        for ex in user_data[user_id]["exercises"]:
-            c.execute("INSERT INTO workouts (user_id, date, exercise, sets, reps, weight) VALUES (?, ?, ?, ?, ?, ?)",
-                      (user_id, date_str, ex["name"], ex["sets"], ex["reps"], ex["weight"]))
-        conn.commit()
-        conn.close()
-        del user_data[user_id]
-        await query.edit_message_text("Тренировка завершена и сохранена!")
-        await query.message.reply_text("Выбери действие:", reply_markup=main_menu_keyboard())
-        return CHOOSE_ACTION
+async def add_exercise_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    text = update.message.text.strip()
+    try:
+        weight = float(text)
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введите число для веса.")
+        return ADD_EXERCISE_WEIGHT
 
-# Показ меню истории
-async def show_history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    conn = sqlite3.connect("workouts.db")
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT date FROM workouts WHERE user_id = ? ORDER BY date DESC", (user_id,))
-    dates = c.fetchall()
-    conn.close()
+    session = user_sessions.get(user_id)
+    exercise = session['current_exercise']
+    exercise['weight'] = weight
 
-    if not dates:
-        await update.message.reply_text("История пуста.")
-        return CHOOSE_ACTION
+    # Сохраняем упражнение в базу
+    c.execute(
+        "INSERT INTO exercises (workout_id, name, sets, reps, weight) VALUES (?, ?, ?, ?, ?)",
+        (session['workout_id'], exercise['name'], exercise['sets'], exercise['reps'], exercise['weight'])
+    )
+    conn.commit()
+    session['exercises'].append(exercise)
+    session.pop('current_exercise')
 
     keyboard = [
-        [InlineKeyboardButton(f"{datetime.strptime(d[0], '%Y-%m-%d').strftime('%A %d.%m.%Y')}", callback_data=f"history_{d[0]}")]
-        for d in dates
+        [InlineKeyboardButton("Добавить ещё упражнение", callback_data='add_another')],
+        [InlineKeyboardButton("Завершить тренировку", callback_data='finish_workout')]
     ]
-    await update.message.reply_text("Выбери дату:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return CHOOSE_ACTION
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Упражнение добавлено. Что дальше?", reply_markup=reply_markup)
+    return CONFIRM_ADD_ANOTHER
 
-# Показ конкретной тренировки
-async def show_history_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def confirm_add_another(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    date = query.data.replace("history_", "")
 
-    conn = sqlite3.connect("workouts.db")
-    c = conn.cursor()
-    c.execute("SELECT exercise, sets, reps, weight FROM workouts WHERE user_id = ? AND date = ?", (user_id, date))
-    records = c.fetchall()
-    conn.close()
+    if query.data == 'add_another':
+        await query.message.edit_text("Введите название упражнения:")
+        return ADD_EXERCISE_NAME
+    elif query.data == 'finish_workout':
+        # Очистим сессию
+        user_sessions.pop(user_id, None)
+        keyboard = [
+            [InlineKeyboardButton("Начать тренировку", callback_data='start_workout')],
+            [InlineKeyboardButton("Просмотреть историю тренировок", callback_data='view_history')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_text("Тренировка завершена!", reply_markup=reply_markup)
+        return MAIN_MENU
 
-    if not records:
-        await query.edit_message_text("Нет записей.")
-    else:
-        text = f"Тренировка за {datetime.strptime(date, '%Y-%m-%d').strftime('%A %d.%m.%Y')}:\n\n"
-        for idx, (name, sets, reps, weight) in enumerate(records, 1):
-            text += f"{idx}. {name} — {sets}x{reps} {weight}кг\n"
-        await query.edit_message_text(text)
+async def show_history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
 
-    await query.message.reply_text("Выбери действие:", reply_markup=main_menu_keyboard())
-    return CHOOSE_ACTION
+    c.execute("SELECT id, date, weekday FROM workouts WHERE user_id = ? ORDER BY date DESC", (user_id,))
+    workouts = c.fetchall()
+    if not workouts:
+        await query.message.edit_text("История тренировок пуста.")
+        return MAIN_MENU
 
-# Запуск бота
+    buttons = []
+    for wid, date, weekday in workouts:
+        btn_text = f"{weekday} {date}"
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"workout_{wid}")])
+
+    buttons.append([InlineKeyboardButton("Назад", callback_data="back_to_main")])
+    reply_markup = InlineKeyboardMarkup(buttons)
+    await query.message.edit_text("Выберите тренировку для просмотра:", reply_markup=reply_markup)
+    return VIEW_HISTORY
+
+async def view_workout_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "back_to_main":
+        keyboard = [
+            [InlineKeyboardButton("Начать тренировку", callback_data='start_workout')],
+            [InlineKeyboardButton("Просмотреть историю тренировок", callback_data='view_history')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_text("Главное меню:", reply_markup=reply_markup)
+        return MAIN_MENU
+
+    if not data.startswith("workout_"):
+        return MAIN_MENU
+
+    workout_id = int(data.split("_")[1])
+    c.execute("SELECT name, sets, reps, weight FROM exercises WHERE workout_id = ?", (workout_id,))
+    exercises = c.fetchall()
+    if not exercises:
+        await query.message.edit_text("Упражнения не найдены для этой тренировки.")
+        return VIEW_HISTORY
+
+    text_lines = []
+    for i, (name, sets, reps, weight) in enumerate(exercises, 1):
+        text_lines.append(f"{i}. {name} — {sets} подходов по {reps} повторений, вес {weight} кг")
+
+    text = "\n".join(text_lines)
+    buttons = [[InlineKeyboardButton("Назад к истории", callback_data="view_history")]]
+    reply_markup = InlineKeyboardMarkup(buttons)
+    await query.message.edit_text(text, reply_markup=reply_markup)
+    return VIEW_WORKOUT_DETAILS
+
+async def back_to_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await show_history_menu(update, context)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отмена. Возвращаемся в главное меню.")
+    keyboard = [
+        [InlineKeyboardButton("Начать тренировку", callback_data='start_workout')],
+        [InlineKeyboardButton("Просмотреть историю тренировок", callback_data='view_history')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Главное меню:", reply_markup=reply_markup)
+    return MAIN_MENU
+
 def main():
-    init_db()
-    app = Application.builder().token("8436341684:AAHuw04R4ZK03tFpLrU98N4XxKI4lu45Hdg").build()
+    app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT, handle_main_menu)],
+        entry_points=[CommandHandler('start', start)],
         states={
-            CHOOSE_ACTION: [
-                MessageHandler(filters.TEXT, handle_main_menu),
-                CallbackQueryHandler(handle_callback, pattern="^(add_more|finish)$"),
-                CallbackQueryHandler(show_history_entry, pattern="^history_.*$")
-            ],
-            EXERCISE_NAME: [MessageHandler(filters.TEXT, input_exercise_name)],
-            SETS: [MessageHandler(filters.TEXT & filters.Regex(r"^\d+$"), input_sets)],
-            REPS: [MessageHandler(filters.TEXT & filters.Regex(r"^\d+$"), input_reps)],
-            WEIGHT: [MessageHandler(filters.TEXT & filters.Regex(r"^\d+(\.\d+)?$"), input_weight)]
+            MAIN_MENU: [CallbackQueryHandler(main_menu_handler)],
+            ADD_EXERCISE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_exercise_name)],
+            ADD_EXERCISE_SETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_exercise_sets)],
+            ADD_EXERCISE_REPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_exercise_reps)],
+            ADD_EXERCISE_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_exercise_weight)],
+            CONFIRM_ADD_ANOTHER: [CallbackQueryHandler(confirm_add_another)],
+            VIEW_HISTORY: [CallbackQueryHandler(show_history_menu)],
+            VIEW_WORKOUT_DETAILS: [CallbackQueryHandler(view_workout_details)],
         },
-        fallbacks=[CommandHandler("start", start)],
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_message=False
     )
 
     app.add_handler(conv_handler)
     app.run_polling()
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+if __name__ == '__main__':
     main()
+
 
 
